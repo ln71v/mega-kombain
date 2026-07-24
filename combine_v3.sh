@@ -3,6 +3,7 @@
 # Цвета для вывода
 GREEN='\033[0;32m'
 RED='\033[0;31m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 check_status() {
@@ -21,18 +22,20 @@ check_status() {
 
     # Проверка WARP
     if ip link show wg-warp &>/dev/null; then
-        echo -e "  WARP:    ${GREEN}🟢 Активен (wg-warp)${NC}"
+        echo -e "  WARP:    ${GREEN}🟢 Активен и работает (wg-warp)${NC}"
+    elif [ -f /etc/wireguard/wg-warp.conf ]; then
+        echo -e "  WARP:    ${YELLOW}⚠️  Установлен, но выключен${NC}"
     else
-        echo -e "  WARP:    ${RED}❌ Не активен${NC}"
+        echo -e "  WARP:    ${RED}❌ Не установлен${NC}"
     fi
     echo "============================================================"
 }
 
 install_warp() {
     echo "→ Установка и настройка WARP..."
-    apt-get update && apt-get install -y wireguard-tools qrencode wget curl
+    apt-get update -qq && apt-get install -y -qq wireguard-tools qrencode wget curl
 
-    # Скачивание wgcf напрямую без API
+    # Скачивание wgcf
     if [ ! -f /usr/local/bin/wgcf ]; then
         echo "→ Загрузка wgcf (v2.2.22)..."
         wget -q --show-progress -O /usr/local/bin/wgcf https://github.com/ViRb38/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64
@@ -44,7 +47,8 @@ install_warp() {
 
     if [ ! -f wgcf-account.toml ]; then
         echo "→ Регистрация аккаунта WARP..."
-        /usr/local/bin/wgcf register --accept-tos
+        yes | /usr/local/bin/wgcf register --accept-tos
+        sleep 2
     fi
 
     if [ ! -f wgcf-profile.conf ]; then
@@ -52,29 +56,39 @@ install_warp() {
         /usr/local/bin/wgcf generate
     fi
 
+    if [ ! -f wgcf-profile.conf ]; then
+        echo -e "${RED}❌ Ошибка генерации профиля. Cloudflare заблокировал запрос.${NC}"
+        read -p "Нажми Enter для продолжения..."
+        return
+    fi
+
     # Подготовка WG интерфейса
     cp wgcf-profile.conf /etc/wireguard/wg-warp.conf
     sed -i 's/Table = auto/Table = off/g' /etc/wireguard/wg-warp.conf 2>/dev/null || true
 
-    echo "→ Запуск wg-warp..."
-    wg-quick up wg-warp || true
-    systemctl enable wg-quick@wg-warp 2>/dev/null || true
+    echo "→ Включение автозагрузки и запуск wg-warp..."
+    systemctl enable wg-quick@wg-warp 2>/dev/null
+    systemctl restart wg-quick@wg-warp
 
-    echo -e "${GREEN}✓ WARP успешно поднят!${NC}"
+    if ip link show wg-warp &>/dev/null; then
+        echo -e "${GREEN}✓ WARP успешно поднят!${NC}"
+    else
+        echo -e "${RED}❌ Ошибка запуска. Интерфейс не поднялся.${NC}"
+    fi
     read -p "Нажми Enter для продолжения..."
 }
 
 down_warp() {
     echo "→ Остановка WARP..."
-    wg-quick down wg-warp 2>/dev/null || true
-    systemctl disable wg-quick@wg-warp 2>/dev/null || true
-    echo -e "${RED}✓ WARP остановлен${NC}"
+    systemctl stop wg-quick@wg-warp 2>/dev/null || true
+    echo -e "${YELLOW}✓ WARP остановлен${NC}"
     read -p "Нажми Enter для продолжения..."
 }
 
 purge_warp() {
     echo "→ Полная очистка WARP..."
-    wg-quick down wg-warp 2>/dev/null || true
+    systemctl stop wg-quick@wg-warp 2>/dev/null || true
+    systemctl disable wg-quick@wg-warp 2>/dev/null || true
     rm -rf /etc/wireguard/wg-warp.conf /etc/wireguard/warp /usr/local/bin/wgcf
     echo -e "${GREEN}✓ WARP полностью удален${NC}"
     read -p "Нажми Enter для продолжения..."
@@ -86,8 +100,8 @@ diagnostics() {
     ip -brief address
     echo -e "\n--- Таблицы маршрутизации ---"
     ip rule show
-    echo -e "\n--- Лог WARP ---"
-    wg show wg-warp 2>/dev/null || echo "WARP интерфейс не активен"
+    echo -e "\n--- Лог службы WARP ---"
+    systemctl status wg-quick@wg-warp --no-pager || echo "Служба не найдена"
     read -p "Нажми Enter для продолжения..."
 }
 
@@ -111,7 +125,7 @@ while true; do
             case $subchoice in
                 1) install_warp ;;
                 2) down_warp ;;
-                3) wg show wg-warp; read -p "Нажми Enter..." ;;
+                3) systemctl status wg-quick@wg-warp --no-pager; wg show wg-warp 2>/dev/null; read -p "Нажми Enter..." ;;
             esac
             ;;
         3) purge_warp ;;
