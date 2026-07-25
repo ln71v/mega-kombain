@@ -58,14 +58,14 @@ apt-get install -y -qq wireguard-tools curl jq
 # --- 2. Регистрация в Cloudflare WARP ----------------------------------
 
 register_warp() {
-  log "Генерация ключевой пары WireGuard..."
+  log "Генерация ключевой пары WireGuard..." >&2
   local privkey pubkey now_ts resp addr_v4 addr_v6
 
   privkey="$(wg genkey)"
   pubkey="$(echo "$privkey" | wg pubkey)"
   now_ts="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 
-  log "Регистрация устройства в Cloudflare WARP..."
+  log "Регистрация устройства в Cloudflare WARP..." >&2
   resp="$(curl -fsSL -X POST "${API_BASE}/reg" \
       -H "Content-Type: application/json" \
       -H "User-Agent: okhttp/3.12.1" \
