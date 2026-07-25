@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+#
+# warp-menu — минимальное меню управления WARP+Amnezia на VPS.
+#
+# Устанавливается как системная команда (см. install-warp-menu.sh),
+# после чего запускается просто: warp-menu
+#
+# Только 4 пункта: статус, установка, отключение, полное удаление.
+# Установка делегируется /usr/local/bin/setup-warp-amnezia.sh —
+# вся логика (регистрация, детект Amnezia, routing) в одном месте.
+
+set -uo pipefail
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+WARP_IFACE="wg-warp"
+WARP_CONF="/etc/wireguard/${WARP_IFACE}.conf"
+SETUP_SCRIPT="/usr/local/bin/setup-warp-amnezia.sh"
+
+if [[ $EUID -ne 0 ]]; then
+  echo -e "${RED}Запусти от root (sudo warp-menu)${NC}" >&2
+  exit 1
+fi
+
+status_line() {
+    if ip link show "$WARP_IFACE" &>/dev/null; then
+        echo -e "${GREEN}🟢 Активен (${WARP_IFACE})${NC}"
+    elif [ -f "$WARP_CONF" ]; then
+        echo -e "${YELLOW}⚠️  Установлен, но выключен${NC}"
+    else
+        echo -e "${RED}❌ Не установлен${NC}"
+    fi
+}
+
+show_status() {
+    clear
+    echo "============================================================"
+    echo "   WARP + Amnezia"
+    echo "============================================================"
+    echo -e "  Статус: $(status_line)"
+    if ip link show "$WARP_IFACE" &>/dev/null; then
+        echo ""
+        wg show "$WARP_IFACE" 2>/dev/null
+    fi
+    echo "============================================================"
+}
+
+install_warp() {
+    if [[ ! -x "$SETUP_SCRIPT" ]]; then
+        echo -e "${RED}Не найден ${SETUP_SCRIPT}.${NC}"
+        echo "Скопируйте setup-warp-amnezia.sh в /usr/local/bin/ и сделайте chmod +x."
+        return 1
+    fi
+    bash "$SETUP_SCRIPT"
+}
+
+disable_warp() {
+    if [[ ! -f "$WARP_CONF" ]]; then
+        echo -e "${RED}WARP не установлен — нечего отключать.${NC}"
+        return 0
+    fi
+    systemctl stop "wg-quick@${WARP_IFACE}" >/dev/null 2>&1
+    echo -e "${YELLOW}✓ WARP отключен (конфиг сохранён — можно включить снова: warp-menu -> 1)${NC}"
+}
+
+remove_warp() {
+    echo -e "${RED}Это полностью удалит WARP и все связанные правила. Продолжить? [y/N]${NC}"
+    read -r -p "> " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Отменено."
+        return 0
+    fi
+    systemctl stop "wg-quick@${WARP_IFACE}" >/dev/null 2>&1
+    systemctl disable "wg-quick@${WARP_IFACE}" >/dev/null 2>&1
+    rm -f "$WARP_CONF"
+    echo -e "${RED}✓ WARP полностью удалён${NC}"
+}
+
+while true; do
+    show_status
+    echo "  1. Установить / переустановить"
+    echo "  2. Отключить (конфиг остаётся)"
+    echo "  3. Удалить полностью"
+    echo "  0. Выйти"
+    echo "============================================================"
+    read -r -p "Выбор: " choice
+    case "$choice" in
+        1) install_warp ;;
+        2) disable_warp ;;
+        3) remove_warp ;;
+        0) exit 0 ;;
+        *) echo -e "${YELLOW}Не понял выбор.${NC}"; sleep 1 ;;
+    esac
+    read -r -p "Нажми Enter..." _
+done
