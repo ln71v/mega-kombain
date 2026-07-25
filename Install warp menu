@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+#
+# install-warp-menu.sh
+#
+# Ставит основной установочный скрипт и меню как системные команды:
+#   /usr/local/bin/setup-warp-amnezia.sh
+#   /usr/local/bin/warp-menu
+#
+# После этого меню запускается из любого места командой:
+#   sudo warp-menu
+#
+# Запускать из директории, где лежат setup-warp-amnezia.sh и warp-menu.sh
+# (например, из /mnt/user-data/outputs после скачивания обоих файлов).
+
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Запусти от root (sudo bash $0)" >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+
+for f in setup-warp-amnezia.sh warp-menu.sh; do
+  if [[ ! -f "${SCRIPT_DIR}/${f}" ]]; then
+    echo "Не найден ${SCRIPT_DIR}/${f} — положите оба файла рядом с этим установщиком." >&2
+    exit 1
+  fi
+done
+
+install -m 755 "${SCRIPT_DIR}/setup-warp-amnezia.sh" /usr/local/bin/setup-warp-amnezia.sh
+install -m 755 "${SCRIPT_DIR}/warp-menu.sh" /usr/local/bin/warp-menu
+
+echo "Готово. Команда доступна: sudo warp-menu"
