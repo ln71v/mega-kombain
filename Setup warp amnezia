@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+#
+# setup-warp-amnezia.sh
+#
+# ПРАВИЛЬНАЯ схема (в отличие от предыдущей версии): заворачивает в
+# Cloudflare WARP именно ТРАНЗИТНЫЙ (forwarded) трафик клиентов
+# AmneziaWG — то есть тот, что реальные VPN-клиенты гоняют через
+# сервер. Раньше скрипт маркировал через iptables-цепочку OUTPUT,
+# которая видит только трафик, порождённый самим хостом (curl, ssh,
+# systemd-сервисы) — транзитный трафик идёт через цепочку FORWARD и
+# туда никогда не попадал, поэтому клиенты Amnezia продолжали
+# выходить в интернет под настоящим IP VPS, хотя сам сервер (SSH,
+# curl и т.п.) корректно уходил через WARP.
+#
+# Правильный подход: маркируем в PREROUTING по входящему интерфейсу
+# Amnezia-контейнера (docker0 / br-xxxx / amn0) — это ловит именно
+# трафик, который контейнер отдаёт на форвардинг наружу.
+#
+# Что делает автоматически:
+#   1. Ставит зависимости (wireguard-tools, curl, jq)
+#   2. Регистрирует устройство в Cloudflare WARP через API
+#   3. Находит контейнер Amnezia, его UDP-порт и сетевой интерфейс
+#      на хосте (для PREROUTING-маркировки)
+#   4. Пишет /etc/wireguard/wg-warp.conf с PostUp/PostDown:
+#      транзитный трафик Amnezia -> WARP, всё остальное (включая
+#      сам хост: SSH, curl и т.п.) не трогается вообще
+#   5. Включает net.ipv4.ip_forward постоянно
+#   6. Включает и запускает wg-quick@wg-warp через systemd
+
+set -uo pipefail
+
+WARP_IFACE="wg-warp"
+WARP_CONF="/etc/wireguard/${WARP_IFACE}.conf"
+WARP_PUBKEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+WARP_ENDPOINT="162.159.192.1:2408"
+RT_TABLE_NUM="200"
+FWMARK="100"
+API_VERSION="v0a884"
+API_BASE="https://api.cloudflareclient.com/${API_VERSION}"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log() { echo -e "\n==> $*"; }
+err() { echo -e "${RED}$*${NC}" >&2; }
+
+if [[ $EUID -ne 0 ]]; then
+  err "Запусти от root (sudo bash $0)"
+  exit 1
+fi
+
+# --- 1. Зависимости ---------------------------------------------------
+
+log "Установка зависимостей..."
+apt-get update -qq
+apt-get install -y -qq wireguard-tools curl jq
+
+# --- 2. Регистрация в Cloudflare WARP ----------------------------------
+
+register_warp() {
+  log "Генерация ключевой пары WireGuard..." >&2
+  local privkey pubkey now_ts resp addr_v4 addr_v6
+
+  privkey="$(wg genkey)"
+  pubkey="$(echo "$privkey" | wg pubkey)"
+  now_ts="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+
+  log "Регистрация устройства в Cloudflare WARP..." >&2
+  resp="$(curl -fsSL -X POST "${API_BASE}/reg" \
+      -H "Content-Type: application/json" \
+      -H "User-Agent: okhttp/3.12.1" \
+      -d "{\"key\":\"${pubkey}\",\"install_id\":\"\",\"fcm_token\":\"\",\"tos\":\"${now_ts}\",\"type\":\"Android\",\"locale\":\"en_US\"}" \
+      2>/dev/null)"
+
+  if [[ -z "$resp" ]]; then
+    err "Регистрация не удалась: пустой ответ от API."
+    err "Проверьте сеть или актуальность API_VERSION (${API_VERSION}) — см. github.com/ViRb3/wgcf."
+    return 1
+  fi
+
+  addr_v4="$(echo "$resp" | jq -r '.config.interface.addresses.v4 // empty')"
+  addr_v6="$(echo "$resp" | jq -r '.config.interface.addresses.v6 // empty')"
+
+  if [[ -z "$addr_v4" ]]; then
+    err "Регистрация вернула ответ без адреса. Ответ API:"
+    echo "$resp" >&2
+    return 1
+  fi
+
+  echo "${privkey}|${addr_v4}|${addr_v6}"
+  return 0
+}
+
+if [[ -f "$WARP_CONF" ]]; then
+  log "Конфиг ${WARP_CONF} уже существует — регистрацию пропускаем, только обновим routing-хуки."
+  PRIVKEY="$(grep -oP '(?<=PrivateKey = ).*' "$WARP_CONF" | head -n1)"
+  ADDR_V4="$(grep -oP '(?<=Address = ).*(?=/32)' "$WARP_CONF" | head -n1)"
+  ADDR_V6="$(grep -oP '(?<=Address = ).*(?=/128)' "$WARP_CONF" | head -n1)"
+else
+  REG_RESULT="$(register_warp)" || exit 1
+  PRIVKEY="$(echo "$REG_RESULT" | cut -d'|' -f1)"
+  ADDR_V4="$(echo "$REG_RESULT" | cut -d'|' -f2)"
+  ADDR_V6="$(echo "$REG_RESULT" | cut -d'|' -f3)"
+  log "Зарегистрировано: ${ADDR_V4}"
+fi
+
+# --- 3. Определение контейнера Amnezia: порт + интерфейс на хосте ------
+
+log "Поиск контейнера Amnezia..."
+AMNEZIA_CID="$(docker ps --format '{{.ID}}\t{{.Names}}' 2>/dev/null | grep -i amnezia | head -n1 | awk '{print $1}')"
+
+if [[ -z "$AMNEZIA_CID" ]]; then
+  err "Контейнер Amnezia не найден через 'docker ps'. Запустите его сначала."
+  exit 1
+fi
+
+log "Контейнер: ${AMNEZIA_CID}"
+
+# Впишите вручную, если автоопределение не сработает.
+MANUAL_AMNEZIA_PORT=""
+MANUAL_AMNEZIA_IFACE=""
+
+detect_amnezia_port() {
+  if [[ -n "$MANUAL_AMNEZIA_PORT" ]]; then
+    echo "$MANUAL_AMNEZIA_PORT"
+    return 0
+  fi
+
+  local iface port
+  iface="$(docker exec "$AMNEZIA_CID" wg show interfaces 2>/dev/null | awk '{print $1}' | head -n1)"
+  if [[ -n "$iface" ]]; then
+    port="$(docker exec "$AMNEZIA_CID" wg show "$iface" listen-port 2>/dev/null)"
+  fi
+
+  if [[ -z "$port" ]]; then
+    port="$(docker port "$AMNEZIA_CID" 2>/dev/null | grep -oP '^\d+(?=/udp)' | head -n1)"
+  fi
+
+  echo "$port"
+}
+
+detect_amnezia_iface() {
+  if [[ -n "$MANUAL_AMNEZIA_IFACE" ]]; then
+    echo "$MANUAL_AMNEZIA_IFACE"
+    return 0
+  fi
+
+  local net_name net_id iface
+
+  net_name="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$AMNEZIA_CID" 2>/dev/null)"
+  if [[ "$net_name" == "bridge" ]]; then
+    echo "docker0"
+    return 0
+  fi
+
+  net_id="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$v.NetworkID}}{{end}}' "$AMNEZIA_CID" 2>/dev/null)"
+  if [[ -n "$net_id" ]]; then
+    iface="$(ip -br link 2>/dev/null | grep -E "^br-${net_id:0:12}" | awk '{print $1}')"
+  fi
+
+  echo "${iface:-amn0}"
+}
+
+AMNEZIA_PORT="$(detect_amnezia_port)"
+AMNEZIA_IFACE="$(detect_amnezia_iface)"
+
+if [[ -z "$AMNEZIA_PORT" ]]; then
+  err "Не удалось автоматически определить UDP-порт AmneziaWG."
+  err "Впишите его в переменную MANUAL_AMNEZIA_PORT в начале скрипта и перезапустите."
+  err "Проверить руками: docker exec ${AMNEZIA_CID} wg show"
+  exit 1
+fi
+
+log "Обнаружено: интерфейс Amnezia на хосте = ${AMNEZIA_IFACE}, UDP-порт = ${AMNEZIA_PORT}"
+echo -e "${YELLOW}Через WARP пойдёт ТОЛЬКО трафик, который контейнер Amnezia пересылает"
+echo -e "своим VPN-клиентам наружу. Сам сервер (SSH, curl и т.п.) не затрагивается.${NC}"
+read -r -p "Верно? Продолжить и записать конфиг wg-warp? [y/N] " confirm
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+  echo "Отменено пользователем. Поправьте MANUAL_AMNEZIA_PORT / MANUAL_AMNEZIA_IFACE и запустите снова."
+  exit 0
+fi
+
+# --- 4. Запись конфига с PREROUTING policy routing ---------------------
+
+log "Запись ${WARP_CONF}..."
+mkdir -p /etc/wireguard
+
+{
+  echo "[Interface]"
+  echo "PrivateKey = ${PRIVKEY}"
+  echo "Address = ${ADDR_V4}/32"
+  [[ -n "${ADDR_V6:-}" ]] && echo "Address = ${ADDR_V6}/128"
+  echo "MTU = 1280"
+  echo "Table = off"
+  echo ""
+  echo "# --- транзитный трафик Amnezia (${AMNEZIA_IFACE}) -> WARP ---"
+  echo "PostUp = ip route replace default dev ${WARP_IFACE} table ${RT_TABLE_NUM}"
+  echo "PostUp = ip rule add fwmark ${FWMARK} table ${RT_TABLE_NUM} priority 100 || true"
+  # Исключаем собственный трафик AmneziaWG (его хендшейк/keepalive к
+  # роутеру, sport = его слушающий порт) — иначе тоннель router↔VPS
+  # тоже уедет в WARP и порвётся (см. предыдущий инцидент с петлёй).
+  echo "PostUp = iptables -t mangle -A PREROUTING -i ${AMNEZIA_IFACE} -p udp --sport ${AMNEZIA_PORT} -j RETURN"
+  echo "PostUp = iptables -t mangle -A PREROUTING -i ${AMNEZIA_IFACE} -j MARK --set-mark ${FWMARK}"
+  echo "PostUp = iptables -t nat -A POSTROUTING -o ${WARP_IFACE} -j MASQUERADE"
+  echo "PostUp = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+  echo ""
+  echo "PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true"
+  echo "PostDown = iptables -t nat -D POSTROUTING -o ${WARP_IFACE} -j MASQUERADE || true"
+  echo "PostDown = iptables -t mangle -D PREROUTING -i ${AMNEZIA_IFACE} -j MARK --set-mark ${FWMARK} || true"
+  echo "PostDown = iptables -t mangle -D PREROUTING -i ${AMNEZIA_IFACE} -p udp --sport ${AMNEZIA_PORT} -j RETURN || true"
+  echo "PostDown = ip rule del fwmark ${FWMARK} table ${RT_TABLE_NUM} priority 100 || true"
+  echo "PostDown = ip route flush table ${RT_TABLE_NUM} || true"
+  echo ""
+  echo "[Peer]"
+  echo "PublicKey = ${WARP_PUBKEY}"
+  echo "AllowedIPs = 0.0.0.0/0"
+  echo "Endpoint = ${WARP_ENDPOINT}"
+  echo "PersistentKeepalive = 25"
+} > "$WARP_CONF"
+
+chmod 600 "$WARP_CONF"
+
+# --- 5. ip_forward постоянно -------------------------------------------
+
+log "Проверка net.ipv4.ip_forward..."
+if [[ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]]; then
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+fi
+if grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf 2>/dev/null; then
+  sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+else
+  echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+fi
+
+# --- 6. Автозапуск через systemd ---------------------------------------
+
+log "Включение автозапуска и старт wg-quick@${WARP_IFACE}..."
+systemctl enable "wg-quick@${WARP_IFACE}" >/dev/null 2>&1
+systemctl restart "wg-quick@${WARP_IFACE}"
+
+sleep 2
+
+if ip link show "$WARP_IFACE" &>/dev/null; then
+  echo -e "${GREEN}✓ WARP поднят и добавлен в автозапуск.${NC}"
+else
+  err "❌ Интерфейс не поднялся. Смотрите: journalctl -u wg-quick@${WARP_IFACE} -n 30 --no-pager"
+  exit 1
+fi
+
+cat <<EOF
+
+Готово. При перезагрузке сервера ${WARP_IFACE} поднимется сам вместе
+со всеми PostUp-правилами.
+
+Через WARP теперь идёт трафик клиентов Amnezia (интерфейс
+${AMNEZIA_IFACE}). Сам сервер (SSH, curl, apt и т.п.) — как раньше,
+через обычный шлюз, без изменений.
+
+Проверка — подключитесь через Amnezia-клиент и на любом
+"какой у меня IP" сайте убедитесь, что показывается НЕ IP вашего VPS,
+а адрес Cloudflare.
+
+Проверка хендшейка WARP на самом VPS:
+  wg show ${WARP_IFACE}
+
+Если интерфейс/порт Amnezia определились неверно — впишите значения
+в MANUAL_AMNEZIA_PORT / MANUAL_AMNEZIA_IFACE и запустите скрипт ещё раз.
+EOF
