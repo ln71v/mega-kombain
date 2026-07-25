@@ -1,175 +1,151 @@
 #!/usr/bin/env bash
 #
-# warp-amnezia-combine.sh
+# route-amnezia-via-warp.sh
 #
-# Админский комбайн: чистый WireGuard-туннель до Cloudflare WARP
-# (без warp-cli — обходит все грабли с меняющимся синтаксисом CLI),
-# уживается рядом с Amnezia (проверяется как отдельный Docker-контейнер).
+# Заворачивает трафик от клиентов AmneziaWG в туннель wg-warp
+# (WireGuard до Cloudflare WARP), так что внешние сайты видят
+# IP Cloudflare вместо реального IP VPS.
 #
-# WARP поднимается с "Table = off" — интерфейс wg-warp создаётся,
-# но НЕ трогает системную таблицу маршрутов и default route.
-# Как использовать конкретно этот туннель (policy routing / отдельные
-# приложения) — решается отдельно, скрипт только поднимает канал.
+# ЧТО ОСТАЁТСЯ БЕЗ ИЗМЕНЕНИЙ:
+#   - основной default route хоста (SSH и весь трафик самого
+#     сервера продолжают идти как раньше — иначе легко потерять
+#     доступ по SSH)
+#   - AmneziaWG как таковой не трогается
 #
-# Регистрация в Cloudflare выполняется автоматически (как это делает
-# wgcf): генерируется локальная пара ключей WireGuard, публичный ключ
-# отправляется на api.cloudflareclient.com, в ответ прилетает
-# персональный адрес (172.16.0.x/32 + IPv6) — без этого шага
-# сервер Cloudflare просто не узнает ваш приватный ключ и хендшейк
-# не пройдёт.
+# ЧТО ДЕЛАЕТ СКРИПТ:
+#   1. Находит Amnezia-контейнер и определяет режим сети (host/bridge)
+#   2. Определяет исходную подсеть VPN-клиентов Amnezia
+#   3. Создаёт отдельную таблицу маршрутизации с default route
+#      через wg-warp
+#   4. Добавляет ip rule: только пакеты ИЗ этой подсети идут по
+#      отдельной таблице (весь остальной трафик хоста не затронут)
+#   5. Добавляет MASQUERADE на wg-warp для этой подсети
+#
+# ВАЖНО: если автоопределение подсети ошибётся — поправьте
+# переменную MANUAL_SUBNET ниже и перезапустите скрипт.
 
 set -uo pipefail
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
 WARP_IFACE="wg-warp"
-WARP_CONF="/etc/wireguard/${WARP_IFACE}.conf"
-WARP_PUBKEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-WARP_ENDPOINT="162.159.192.1:2408"
-# Версия API периодически меняется у Cloudflare (u wgcf это тоже
-# всплывающая проблема) — если регистрация вернёт 4xx, проверьте
-# актуальную версию в проекте github.com/ViRb3/wgcf.
-API_VERSION="v0a884"
-API_BASE="https://api.cloudflareclient.com/${API_VERSION}"
+RT_TABLE_NUM="200"
+RT_TABLE_NAME="warp-out"
+
+# Если знаете подсеть клиентов Amnezia точно — впишите сюда,
+# например "10.8.0.0/24", и автоопределение будет пропущено.
+MANUAL_SUBNET=""
 
 if [[ $EUID -ne 0 ]]; then
   echo "Запусти от root (sudo bash $0)" >&2
   exit 1
 fi
 
-check_status() {
-    clear
-    echo "============================================================"
-    echo "   АДМИНСКИЙ КОМБАЙН (WARP + Amnezia) — MASTER EDITION   "
-    echo "============================================================"
+if ! ip link show "$WARP_IFACE" &>/dev/null; then
+  echo "Интерфейс ${WARP_IFACE} не найден. Сначала поднимите WARP." >&2
+  exit 1
+fi
 
-    AMNEZIA_CONTAINER=$(docker ps --format "{{.Names}}\t{{.Status}}" 2>/dev/null | grep -i amnezia | head -n 1)
-    if [ -n "$AMNEZIA_CONTAINER" ]; then
-        echo -e "  Amnezia: ${GREEN}✅ $AMNEZIA_CONTAINER${NC}"
-    else
-        echo -e "  Amnezia: ${RED}❌ Не найден / Отключен${NC}"
-    fi
+echo "→ Поиск контейнера Amnezia..."
+AMNEZIA_CID="$(docker ps --format '{{.ID}}\t{{.Names}}' 2>/dev/null | grep -i amnezia | head -n1 | awk '{print $1}')"
 
-    if ip link show "$WARP_IFACE" &>/dev/null; then
-        echo -e "  WARP:    ${GREEN}🟢 Активен (${WARP_IFACE})${NC}"
-    elif [ -f "$WARP_CONF" ]; then
-        echo -e "  WARP:    ${YELLOW}⚠️  Установлен, но выключен${NC}"
-    else
-        echo -e "  WARP:    ${RED}❌ Не установлен${NC}"
-    fi
-    echo "============================================================"
-}
+if [[ -z "$AMNEZIA_CID" ]]; then
+  echo "Контейнер Amnezia не найден через 'docker ps'. Запустите сначала его." >&2
+  exit 1
+fi
 
-register_warp() {
-    # Возвращает 0 и печатает готовый конфиг-файл в WARP_CONF при успехе.
-    echo "→ Генерация ключевой пары WireGuard..."
-    local privkey pubkey now_ts resp
+echo "→ Найден контейнер: ${AMNEZIA_CID}"
 
-    privkey="$(wg genkey)"
-    pubkey="$(echo "$privkey" | wg pubkey)"
-    now_ts="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+NETWORK_MODE="$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$AMNEZIA_CID")"
+echo "→ Режим сети контейнера: ${NETWORK_MODE}"
 
-    echo "→ Регистрация устройства в Cloudflare WARP..."
-    resp="$(curl -fsSL -X POST "${API_BASE}/reg" \
-        -H "Content-Type: application/json" \
-        -H "User-Agent: okhttp/3.12.1" \
-        -d "{\"key\":\"${pubkey}\",\"install_id\":\"\",\"fcm_token\":\"\",\"tos\":\"${now_ts}\",\"type\":\"Android\",\"locale\":\"en_US\"}" \
-        2>/dev/null)"
-
-    if [[ -z "$resp" ]]; then
-        echo -e "${RED}Регистрация не удалась: пустой ответ от API.${NC}" >&2
-        echo "Проверь сеть/доступность api.cloudflareclient.com или актуальность API_VERSION (${API_VERSION})." >&2
-        return 1
-    fi
-
-    local addr_v4 addr_v6
-    addr_v4="$(echo "$resp" | jq -r '.config.interface.addresses.v4 // empty')"
-    addr_v6="$(echo "$resp" | jq -r '.config.interface.addresses.v6 // empty')"
-
-    if [[ -z "$addr_v4" ]]; then
-        echo -e "${RED}Регистрация вернула ответ без адреса. Ответ API:${NC}" >&2
-        echo "$resp" >&2
-        return 1
-    fi
-
-    mkdir -p /etc/wireguard
-    cat > "$WARP_CONF" << EOF
-[Interface]
-PrivateKey = ${privkey}
-Address = ${addr_v4}/32
-$( [[ -n "$addr_v6" ]] && echo "Address = ${addr_v6}/128" )
-DNS = 1.1.1.1
-Table = off
-
-[Peer]
-PublicKey = ${WARP_PUBKEY}
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = ${WARP_ENDPOINT}
-PersistentKeepalive = 25
-EOF
-
-    chmod 600 "$WARP_CONF"
-    echo -e "${GREEN}Конфиг сгенерирован и зарегистрирован: ${addr_v4}${NC}"
+detect_subnet() {
+  if [[ -n "$MANUAL_SUBNET" ]]; then
+    echo "$MANUAL_SUBNET"
     return 0
-}
+  fi
 
-install_warp() {
-    echo "→ Установка зависимостей..."
-    apt-get update -qq && apt-get install -y -qq wireguard-tools curl jq
-
-    if [[ ! -f "$WARP_CONF" ]]; then
-        if ! register_warp; then
-            echo -e "${RED}❌ Установка прервана из-за ошибки регистрации.${NC}"
-            read -r -p "Нажми Enter..."
-            return 1
-        fi
-    else
-        echo -e "${GREEN}Конфигурация уже существует, пропускаем регистрацию.${NC}"
+  if [[ "$NETWORK_MODE" == "host" ]]; then
+    # В host-режиме подсеть VPN-клиентов определяется внутри
+    # самого контейнера — смотрим на его WireGuard-интерфейс(ы).
+    local subnet
+    subnet="$(docker exec "$AMNEZIA_CID" sh -c "ip -4 addr show 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}'" \
+      | grep -vE '^(127\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.)' \
+      | head -n1)"
+    if [[ -n "$subnet" ]]; then
+      # Приводим конкретный IP-адрес интерфейса к подсети /24
+      # (обычно так и раздаёт Amnezia клиентам)
+      echo "$subnet" | awk -F. '{split($0,a,"."); print a[1]"."a[2]"."a[3]".0/24"}' \
+        | sed 's#/24/[0-9]*#/24#'
     fi
-
-    echo "→ Запуск службы WARP..."
-    systemctl enable "wg-quick@${WARP_IFACE}" >/dev/null 2>&1
-    systemctl restart "wg-quick@${WARP_IFACE}" >/dev/null 2>&1
-
-    if ip link show "$WARP_IFACE" &>/dev/null; then
-        echo -e "${GREEN}✓ WARP успешно поднят!${NC}"
-    else
-        echo -e "${RED}❌ Не удалось поднять интерфейс.${NC}"
-        echo "Смотри: journalctl -u wg-quick@${WARP_IFACE} -n 30 --no-pager"
-    fi
-    read -r -p "Нажми Enter..."
+  else
+    # Bridge/NAT: берём подсеть docker-сети, к которой подключен контейнер
+    docker inspect --format '{{range $net,$conf := .NetworkSettings.Networks}}{{$conf.IPAMConfig}}{{end}}' "$AMNEZIA_CID" >/dev/null 2>&1
+    local netname subnet
+    netname="$(docker inspect --format '{{range $net,$conf := .NetworkSettings.Networks}}{{$net}}{{end}}' "$AMNEZIA_CID" | head -n1)"
+    subnet="$(docker network inspect "$netname" --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null)"
+    echo "$subnet"
+  fi
 }
 
-down_warp() {
-    systemctl stop "wg-quick@${WARP_IFACE}" >/dev/null 2>&1
-    echo -e "${YELLOW}✓ WARP остановлен${NC}"
-    read -r -p "Нажми Enter..."
-}
+SUBNET="$(detect_subnet)"
 
-purge_warp() {
-    systemctl stop "wg-quick@${WARP_IFACE}" >/dev/null 2>&1
-    systemctl disable "wg-quick@${WARP_IFACE}" >/dev/null 2>&1
-    rm -f "$WARP_CONF"
-    echo -e "${RED}✓ WARP полностью удален${NC}"
-    read -r -p "Нажми Enter..."
-}
+if [[ -z "$SUBNET" ]]; then
+  echo -e "\nНе удалось автоматически определить подсеть клиентов Amnezia." >&2
+  echo "Впишите её вручную в переменную MANUAL_SUBNET в начале скрипта и перезапустите." >&2
+  echo "Проверить руками можно так:" >&2
+  echo "  docker exec ${AMNEZIA_CID} ip addr        # если host network" >&2
+  echo "  docker network inspect <имя_сети>          # если bridge" >&2
+  exit 1
+fi
 
-while true; do
-    check_status
-    echo "  1. Установить / Запустить WARP"
-    echo "  2. Остановить WARP"
-    echo "  3. Полная зачистка WARP"
-    echo "  0. Выйти"
-    echo "============================================================"
-    read -r -p "Твой выбор, начальник: " choice
-    case "$choice" in
-        1) install_warp ;;
-        2) down_warp ;;
-        3) purge_warp ;;
-        0) exit 0 ;;
-        *) echo -e "${YELLOW}Не понял выбор, попробуй ещё раз.${NC}"; sleep 1 ;;
-    esac
-done
+echo -e "\n→ Определена подсеть клиентов Amnezia: ${SUBNET}"
+read -r -p "Верно? Продолжить настройку policy routing через ${WARP_IFACE}? [y/N] " confirm
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+  echo "Отменено пользователем."
+  exit 0
+fi
+
+echo "→ Настройка отдельной таблицы маршрутизации (${RT_TABLE_NAME}, ${RT_TABLE_NUM})"
+if ! grep -q "^${RT_TABLE_NUM}[[:space:]]\+${RT_TABLE_NAME}$" /etc/iproute2/rt_tables 2>/dev/null; then
+  echo "${RT_TABLE_NUM} ${RT_TABLE_NAME}" >> /etc/iproute2/rt_tables
+fi
+
+# default route в отдельной таблице — только через wg-warp
+ip route replace default dev "$WARP_IFACE" table "$RT_TABLE_NAME"
+
+# правило: пакеты с исходным адресом из подсети Amnezia идут по этой таблице
+# (остальной трафик хоста, включая SSH, таблицу не затрагивает)
+if ! ip rule show | grep -q "from ${SUBNET} lookup ${RT_TABLE_NAME}"; then
+  ip rule add from "$SUBNET" table "$RT_TABLE_NAME" priority 100
+fi
+
+echo "→ Настройка MASQUERADE на ${WARP_IFACE} для подсети ${SUBNET}"
+if ! iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$WARP_IFACE" -j MASQUERADE 2>/dev/null; then
+  iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$WARP_IFACE" -j MASQUERADE
+fi
+
+# ip_forward должен быть включен, иначе пересылка пакетов не работает вообще
+if [[ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]]; then
+  echo "→ Включение net.ipv4.ip_forward"
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf \
+    && sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf \
+    || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+fi
+
+cat <<EOF
+
+Готово.
+
+Трафик из подсети ${SUBNET} (клиенты Amnezia) теперь маршрутизируется
+через ${WARP_IFACE} и выходит наружу под IP Cloudflare.
+SSH и весь остальной трафик хоста продолжают идти через обычный default route.
+
+Проверка с клиента, подключённого к Amnezia:
+  curl https://2ip.ru
+  # или
+  curl https://www.cloudflare.com/cdn-cgi/trace/   # ищите "warp=on"
+
+Это правило не переживёт перезагрузку сервера — если нужно, чтобы оно
+применялось автоматически при старте, скажите, добавлю systemd unit
+или строку в rc.local / netplan post-up.
+EOF
