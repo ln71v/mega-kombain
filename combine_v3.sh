@@ -187,6 +187,13 @@ mkdir -p /etc/wireguard
   # Needed" по пути фильтруется) — маленькие пакеты (хендшейк, curl)
   # при этом проходят нормально, что маскирует проблему на первый взгляд.
   echo "MTU = 1280"
+  # DNS = 1.1.1.1 — важно при глобальной схеме: резолвер, прописанный
+  # хостером в /etc/resolv.conf, часто приватный (доступен только
+  # через физический аплинк). Раз почти весь трафик теперь уходит
+  # через WARP, системе нужен публичный резолвер, достижимый именно
+  # через тоннель — иначе резолвинг молча ломается (curl/apt и т.п.
+  # начинают падать с "Could not resolve host").
+  echo "DNS = 1.1.1.1"
   # Table = off остаётся: без него wg-quick сам пропишет свой default
   # route в main-таблицу, и тот будет конфликтовать с нашим ручным
   # исключением SSH/Amnezia через "table main" ниже. Разруливаем
@@ -199,12 +206,21 @@ mkdir -p /etc/wireguard
   echo "PostUp = ip rule add ipproto udp sport ${AMNEZIA_PORT} table main priority 51 || true"
   echo "PostUp = ip rule add fwmark 1 table ${RT_TABLE_NUM} priority 100 || true"
   echo "PostUp = iptables -t mangle -A OUTPUT -j MARK --set-mark 1"
+  # КРИТИЧНО: без этого исключения собственный транспортный UDP-трафик
+  # WireGuard к эндпоинту Cloudflare тоже маркируется меткой 1 и уходит
+  # в table 200, чей default route — сам wg-warp. Получается routing
+  # loop: зашифрованный пакет пытается выйти через тот же интерфейс,
+  # который его и генерирует, и физически никогда не покидает сервер
+  # (при этом счётчик "sent" в wg show продолжает расти, создавая
+  # иллюзию, что трафик уходит).
+  echo "PostUp = iptables -t mangle -A OUTPUT -p udp --dport ${WARP_ENDPOINT##*:} -d ${WARP_ENDPOINT%:*} -j MARK --set-mark 0"
   echo "PostUp = iptables -t mangle -A OUTPUT -p tcp --sport ${SSH_PORT} -j MARK --set-mark 0"
   echo "PostUp = iptables -t mangle -A OUTPUT -p udp --sport ${AMNEZIA_PORT} -j MARK --set-mark 0"
   echo "PostUp = iptables -t nat -A POSTROUTING -o ${WARP_IFACE} -j MASQUERADE"
   echo ""
   echo "PostDown = iptables -t nat -D POSTROUTING -o ${WARP_IFACE} -j MASQUERADE || true"
   echo "PostDown = iptables -t mangle -D OUTPUT -p udp --sport ${AMNEZIA_PORT} -j MARK --set-mark 0 || true"
+  echo "PostDown = iptables -t mangle -D OUTPUT -p udp --dport ${WARP_ENDPOINT##*:} -d ${WARP_ENDPOINT%:*} -j MARK --set-mark 0 || true"
   echo "PostDown = iptables -t mangle -D OUTPUT -p tcp --sport ${SSH_PORT} -j MARK --set-mark 0 || true"
   echo "PostDown = iptables -t mangle -D OUTPUT -j MARK --set-mark 1 || true"
   echo "PostDown = ip rule del fwmark 1 table ${RT_TABLE_NUM} priority 100 || true"
