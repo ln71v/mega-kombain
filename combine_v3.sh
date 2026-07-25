@@ -181,6 +181,12 @@ mkdir -p /etc/wireguard
   echo "PrivateKey = ${PRIVKEY}"
   echo "Address = ${ADDR_V4}/32"
   [[ -n "${ADDR_V6:-}" ]] && echo "Address = ${ADDR_V6}/128"
+  # MTU 1280 — официальная рекомендация Cloudflare/wgcf для WARP.
+  # Без явного MTU wg-quick ставит ~1420, а на многих сетях крупные
+  # пакеты в туннель до Cloudflare молча теряются (ICMP "Fragmentation
+  # Needed" по пути фильтруется) — маленькие пакеты (хендшейк, curl)
+  # при этом проходят нормально, что маскирует проблему на первый взгляд.
+  echo "MTU = 1280"
   # Table = off остаётся: без него wg-quick сам пропишет свой default
   # route в main-таблицу, и тот будет конфликтовать с нашим ручным
   # исключением SSH/Amnezia через "table main" ниже. Разруливаем
